@@ -2,20 +2,24 @@ import logging
 import sqlite3
 import os
 import time
+import asyncio
 import subprocess
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
-import speech_recognition as sr
+import edge_tts
 
-# Configuration - use environment variables with fallbacks
+# Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8630873005:AAEO2Vhd9SIJI8AlDdbigCpkJU0AH_ZHQr8")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAwzOHeaidFatRxII2r0nTySbYoqmXenRE")
 
-# Use /tmp for writable storage on Railway
+# Use /tmp for writable storage
 BASE_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/tmp")
 DB_PATH = os.path.join(BASE_DIR, "memory.db")
 TEMP_DIR = "/tmp"
+
+# Female Bengali voice for Edge TTS
+VOICE_NAME = "bn-BD-NabanitaNeural"  # Bengali female voice
 
 # Configure logging
 logging.basicConfig(
@@ -56,20 +60,10 @@ def get_memories(user_id, limit=20):
                    (user_id, limit))
     memories = cursor.fetchall()
     conn.close()
-    return memories[::-1]  # Return in chronological order
+    return memories[::-1]
 
-# Bot commands and handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "আরে Rega Sir! আমি আপনার ব্রেইন ব্যাকআপ বট। "
-        "আপনি যা বলবেন সব মনে রাখব। কি মনে রাখতে হবে বলেন?"
-    )
-
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user_message = update.message.text
-
-    # Retrieve recent memories to provide context to Gemini
+def get_ai_response(user_id, user_message):
+    """Get response from Gemini AI with memory context"""
     recent_memories = get_memories(user_id)
     memory_context = ""
     if recent_memories:
@@ -88,53 +82,116 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     prompt = f"{system_instruction}\n\n{memory_context}\nRega Sir: {user_message}\nসহকারী:"
 
-    bot_response = None
     for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt
             )
-            bot_response = response.text
-            break
+            return response.text
         except Exception as e:
             logger.error(f"Gemini API error (attempt {attempt+1}): {e}")
             if attempt < 2:
                 time.sleep(30)
-            else:
-                bot_response = "Rega Sir, একটু সমস্যা হচ্ছে কথা বুঝতে। আবার বলবেন নাকি?"
+    return "Rega Sir, একটু সমস্যা হচ্ছে। আবার বলবেন নাকি?"
 
-    if bot_response:
-        save_memory(user_id, user_message, bot_response)
-        await update.message.reply_text(bot_response)
+async def text_to_voice(text, output_path):
+    """Convert text to speech using Edge TTS with female Bengali voice"""
+    communicate = edge_tts.Communicate(text, VOICE_NAME)
+    await communicate.save(output_path)
+
+# Bot commands and handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    welcome = "আরে Rega Sir! আমি আপনার ব্রেইন ব্যাকআপ বট। আপনি যা বলবেন সব মনে রাখব। কি মনে রাখতে হবে বলেন?"
+    await update.message.reply_text(welcome)
+    # Also send voice
+    voice_path = os.path.join(TEMP_DIR, f"welcome_{update.effective_user.id}.mp3")
+    try:
+        await text_to_voice(welcome, voice_path)
+        with open(voice_path, 'rb') as audio:
+            await update.message.reply_voice(voice=audio)
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+    finally:
+        if os.path.exists(voice_path):
+            os.remove(voice_path)
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    user_message = update.message.text
+
+    bot_response = get_ai_response(user_id, user_message)
+    save_memory(user_id, user_message, bot_response)
+
+    # Send text reply
+    await update.message.reply_text(bot_response)
+
+    # Send voice reply
+    voice_path = os.path.join(TEMP_DIR, f"reply_{user_id}_{int(time.time())}.mp3")
+    try:
+        await text_to_voice(bot_response, voice_path)
+        with open(voice_path, 'rb') as audio:
+            await update.message.reply_voice(voice=audio)
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+    finally:
+        if os.path.exists(voice_path):
+            os.remove(voice_path)
 
 async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages - transcribe using Gemini and respond"""
+    user_id = update.effective_user.id
     voice_file = await update.message.voice.get_file()
     ogg_path = os.path.join(TEMP_DIR, f"{voice_file.file_id}.ogg")
-    wav_path = os.path.join(TEMP_DIR, f"{voice_file.file_id}.wav")
 
     await voice_file.download_to_drive(ogg_path)
 
     try:
-        subprocess.run(['ffmpeg', '-i', ogg_path, wav_path, '-y'],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Use Gemini to transcribe the audio
+        with open(ogg_path, 'rb') as f:
+            audio_data = f.read()
 
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data, language='bn-BD')
-            logger.info(f"Transcribed voice: {text}")
+        # Upload audio to Gemini for transcription
+        transcribe_response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                {
+                    'role': 'user',
+                    'parts': [
+                        {'text': 'এই অডিওতে কী বলা হয়েছে? শুধু কথাটা হুবহু লিখে দাও, অন্য কিছু বলো না।'},
+                        {'inline_data': {'mime_type': 'audio/ogg', 'data': __import__('base64').b64encode(audio_data).decode()}}
+                    ]
+                }
+            ]
+        )
+        transcribed_text = transcribe_response.text.strip()
+        logger.info(f"Transcribed voice: {transcribed_text}")
 
-            update.message.text = text
-            await chat(update, context)
+        # Get AI response
+        bot_response = get_ai_response(user_id, transcribed_text)
+        save_memory(user_id, transcribed_text, bot_response)
+
+        # Send text reply (showing what was heard + response)
+        await update.message.reply_text(f"🎤 শুনেছি: {transcribed_text}\n\n{bot_response}")
+
+        # Send voice reply
+        voice_path = os.path.join(TEMP_DIR, f"reply_{user_id}_{int(time.time())}.mp3")
+        try:
+            await text_to_voice(bot_response, voice_path)
+            with open(voice_path, 'rb') as audio:
+                await update.message.reply_voice(voice=audio)
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+        finally:
+            if os.path.exists(voice_path):
+                os.remove(voice_path)
+
     except Exception as e:
         logger.error(f"Voice processing error: {e}")
         await update.message.reply_text("Rega Sir, আপনার ভয়েসটা ঠিকঠাক বুঝতে পারলাম না। আরেকবার বলবেন?")
     finally:
         if os.path.exists(ogg_path):
             os.remove(ogg_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 def main() -> None:
     init_db()
