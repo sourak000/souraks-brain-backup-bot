@@ -10,8 +10,8 @@ from google import genai
 import edge_tts
 
 # Configuration
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8630873005:AAEO2Vhd9SIJI8AlDdbigCpkJU0AH_ZHQr8")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAwzOHeaidFatRxII2r0nTySbYoqmXenRE")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Use /tmp for writable storage
 BASE_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/tmp")
@@ -85,14 +85,14 @@ def get_ai_response(user_id, user_message):
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-2.0-flash-lite',
                 contents=prompt
             )
             return response.text
         except Exception as e:
             logger.error(f"Gemini API error (attempt {attempt+1}): {e}")
             if attempt < 2:
-                time.sleep(30)
+                time.sleep(5)
     return "Rega Sir, একটু সমস্যা হচ্ছে। আবার বলবেন নাকি?"
 
 async def text_to_voice(text, output_path):
@@ -153,7 +153,7 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Upload audio to Gemini for transcription
         transcribe_response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash-lite',
             contents=[
                 {
                     'role': 'user',
