@@ -4,14 +4,15 @@ import os
 import time
 import asyncio
 import subprocess
+import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from google import genai
+from openai import OpenAI
 import edge_tts
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # Use /tmp for writable storage
 BASE_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/tmp")
@@ -27,8 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize Groq client (OpenAI-compatible)
+groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
 
 # Database functions
 def init_db():
@@ -63,37 +67,59 @@ def get_memories(user_id, limit=20):
     return memories[::-1]
 
 def get_ai_response(user_id, user_message):
-    """Get response from Gemini AI with memory context"""
+    """Get response from Groq AI with memory context"""
     recent_memories = get_memories(user_id)
-    memory_context = ""
-    if recent_memories:
-        memory_context = "স্মৃতি (পূর্বের কথা):\n"
-        for um, br in recent_memories:
-            memory_context += f"Rega Sir: {um}\nসহকারী: {br}\n"
-
-    system_instruction = (
-        "আপনি Rega Sir এর একজন ব্যক্তিগত সহকারী। "
-        "আপনি রাজশাহী, বাংলাদেশের একজন স্থানীয় ব্যক্তির মতো করে খুব সহজ এবং অনানুষ্ঠানিক (casual) বাংলায় কথা বলবেন। "
-        "আপনি সবসময় Rega Sir কে 'Rega Sir' বলে সম্বোধন করবেন। "
-        "আপনার প্রধান কাজ হলো Rega Sir যা বলেন তা মনে রাখা এবং পরে জিজ্ঞাসা করলে উত্তর দেওয়া। "
-        "স্মৃতিতে থাকা তথ্য ব্যবহার করে উত্তর দিন। "
-        "উত্তর সংক্ষিপ্ত এবং সরাসরি দিন।"
-    )
-
-    prompt = f"{system_instruction}\n\n{memory_context}\nRega Sir: {user_message}\nসহকারী:"
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "আপনি Rega Sir এর একজন ব্যক্তিগত সহকারী। "
+                "আপনি রাজশাহী, বাংলাদেশের একজন স্থানীয় ব্যক্তির মতো করে খুব সহজ এবং অনানুষ্ঠানিক (casual) বাংলায় কথা বলবেন। "
+                "আপনি সবসময় Rega Sir কে 'Rega Sir' বলে সম্বোধন করবেন। "
+                "আপনার প্রধান কাজ হলো Rega Sir যা বলেন তা মনে রাখা এবং পরে জিজ্ঞাসা করলে উত্তর দেওয়া। "
+                "স্মৃতিতে থাকা তথ্য ব্যবহার করে উত্তর দিন। "
+                "উত্তর সংক্ষিপ্ত এবং সরাসরি দিন।"
+            )
+        }
+    ]
+    
+    # Add memory context as previous messages
+    for um, br in recent_memories:
+        messages.append({"role": "user", "content": um})
+        messages.append({"role": "assistant", "content": br})
+    
+    # Add current message
+    messages.append({"role": "user", "content": user_message})
 
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model='gemini-2.0-flash-lite',
-                contents=prompt
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.7
             )
-            return response.text
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error(f"Gemini API error (attempt {attempt+1}): {e}")
+            logger.error(f"Groq API error (attempt {attempt+1}): {e}")
             if attempt < 2:
-                time.sleep(5)
+                time.sleep(3)
     return "Rega Sir, একটু সমস্যা হচ্ছে। আবার বলবেন নাকি?"
+
+def transcribe_audio(audio_path):
+    """Transcribe audio using Groq Whisper"""
+    try:
+        with open(audio_path, 'rb') as audio_file:
+            transcription = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=audio_file,
+                language="bn"
+            )
+        return transcription.text.strip()
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return None
 
 async def text_to_voice(text, output_path):
     """Convert text to speech using Edge TTS with female Bengali voice"""
@@ -139,7 +165,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             os.remove(voice_path)
 
 async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice messages - transcribe using Gemini and respond"""
+    """Handle voice messages - transcribe using Groq Whisper and respond"""
     user_id = update.effective_user.id
     voice_file = await update.message.voice.get_file()
     ogg_path = os.path.join(TEMP_DIR, f"{voice_file.file_id}.ogg")
@@ -147,24 +173,13 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await voice_file.download_to_drive(ogg_path)
 
     try:
-        # Use Gemini to transcribe the audio
-        with open(ogg_path, 'rb') as f:
-            audio_data = f.read()
+        # Transcribe using Groq Whisper
+        transcribed_text = transcribe_audio(ogg_path)
+        
+        if not transcribed_text:
+            await update.message.reply_text("Rega Sir, আপনার ভয়েসটা ঠিকঠাক বুঝতে পারলাম না। আরেকবার বলবেন?")
+            return
 
-        # Upload audio to Gemini for transcription
-        transcribe_response = client.models.generate_content(
-            model='gemini-2.0-flash-lite',
-            contents=[
-                {
-                    'role': 'user',
-                    'parts': [
-                        {'text': 'এই অডিওতে কী বলা হয়েছে? শুধু কথাটা হুবহু লিখে দাও, অন্য কিছু বলো না।'},
-                        {'inline_data': {'mime_type': 'audio/ogg', 'data': __import__('base64').b64encode(audio_data).decode()}}
-                    ]
-                }
-            ]
-        )
-        transcribed_text = transcribe_response.text.strip()
         logger.info(f"Transcribed voice: {transcribed_text}")
 
         # Get AI response
